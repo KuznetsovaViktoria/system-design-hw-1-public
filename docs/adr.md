@@ -1,21 +1,40 @@
 # ADR: Сервис аренды пауэрбанков
 
-## Контекст
+## Бизнес-задача
 
-### Исходно
-Изначально монолит, храним данные в памяти и синхронно обращается к внешним сервисам без кэшей, фоллбэков, идемпотентности.
+Нужен сервис для аренды пауэрбанков на станциях. Пользователь приходит к станции, берёт павер, пользуется, возвращает в любую станцию и платит за время использования.
 
-### Требования
-- **Maintainability**: разделение ответственности, модульность
-- **Reliability**: кэширование, фоллбэки, идемпотентность
-- **Scalability**: возможность независимого масштабирования компонентов
-- **Observability**: структурированные логи, метрики
+**Функциональные требования:**
+- Создать оффер на аренду (показать цену, депозит, условия)
+- Начать аренду - выдать павер со станции
+- Вернуть павер на любой станции
+- Посчитать стоимость по времени аренды
+- Списать деньги с пользователя
+- Показать информацию о текущей аренде
 
-### Параметры нагрузки
-- **X = 10 RPS** — одновременное создание заказов
-- **Y = 100** — число просмотров информации об аренде на одну аренду
-- **Z = 1 КБ** — размер записи об аренде
-- **Хранение**: 2 года
+### Нефункциональные требования по заданию
+
+**Maintainability:**
+- Код разбит на модули по доменам (аренда, цены, платежи)
+- Каждый сервис можно разрабатывать и деплоить отдельно
+- Изменение логики цен не трогает логику аренды
+
+**Reliability:**
+- Если тарифы недоступны -> используем кэш (до 10 минут свежести)
+- Если users недоступен -> берём повышенную цену (жадный прайсинг)
+- Если payments недоступен -> создаём долг, пускаем в аренду
+- Если stations недоступен -> отказываем (это критично, без станции банку не выдать)
+- Повторный запрос с тем же ключом идемпотентности -> возвращаем тот же результат
+
+**Scalability:**
+- При росте нагрузки на просмотр цен можем поднять больше инстансов pricing
+- При росте нагрузки на аренду можем поднять больше инстансов rentals
+- Кэши снижают нагрузку на внешние сервисы в 10-20 раз
+
+**Observability:**
+- JSON логи с request_id, user_id, rental_id для трейсинга запросов
+- Метрики Prometheus: RPS, латентность, hit rate кэшей, число долгов
+- По метрикам видно, когда внешний сервис падает (растут ошибки кэша)
 
 ### Внешние зависимости
 **Критичные:**
@@ -31,7 +50,62 @@
 
 ## Решение
 
-**Микросервисная архитектура** с разделением на 3 сервиса
+**Микросервисная архитектура** с разделением на 3 сервиса на Python + FastAPI
+
+### Рассмотренные альтернативы
+
+#### 1. Разделение сервисов
+
+**4 сервиса (Offers, Rentals, Pricing, Billing)**
+- ✅ Чёткое разделение: офферы отдельно от заказов
+- ❌ Офферы и рентал тесно связаны (один оффер -> одна аренда)
+- ❌ Лишняя сложность: два сервиса постоянно общаются
+- ❌ Офферы живут 10 минут, не нужен отдельный сервис
+
+**3 сервиса (Rentals+Offers, Pricing, Billing)** <- **выбрали**
+- ✅ Офферы и рентал в одном сервисе (связаны жизненным циклом)
+- ✅ Pricing отдельно (переиспользуется: оффер, summary, return)
+- ✅ Billing отдельно (своя логика долгов, reconciliation)
+- ✅ Баланс
+
+- Офферы — это "черновик" аренды, живут 10 минут
+- Один оффер создаёт одну аренду (тесная связь)
+- Разделять их кажется излишним
+
+#### 2. Выделение Pricing и размещение Offers
+
+**Вариант А: offers+pricing в одном сервисе**
+- ✅ Офферы создаются с расчётом цены (логически связаны)
+- ✅ Нет HTTP вызова Rentals -> Pricing при создании оффера
+- ❌ Расчёт цены нужен не только для офферов (summary, return)
+- ❌ Кэш тарифов и фоллбэки смешаются с логикой офферов
+
+**Вариант Б: pricing отдельно, offers в rentals** <- **выбрали**
+- ✅ Расчёт цены переиспользуется: оффер, summary, return
+- ✅ Pricing изолирован (кэш тарифов, фоллбэки, жадный прайсинг)
+- ✅ Можно масштабировать Pricing отдельно
+- ❌ Один HTTP вызов при создании оффера
+
+**Обоснование:**
+- Расчёт цены нужен в 3 местах, не только для офферов
+- Pricing — это переиспользуемый компонент
+- Офферы тесно связаны с арендой (один оффер -> одна аренда)
+
+#### 3. База данных
+
+**Одна БД на все сервисы** <- **выбрали**
+- ✅ Проще для дз (один SQLite файл)
+- ✅ Не нужно настраивать репликацию/синхронизацию
+- ✅ ACID транзакции работают
+- ❌ Связанность через БД (но таблицы изолированы)
+- ❌ Для прода не подходит
+
+**БД на каждый сервис**
+- ✅ Полная изоляция сервисов
+- ✅ Можно использовать разные типы БД
+- ❌ Сложнее для дз поднять локально
+- ❌ Нужна eventual consistency
+- ❌ Нет транзакций между сервисами
 
 ### Структура сервисов
 
@@ -60,13 +134,14 @@
 
 ### 1. Rentals Service (Core)
 
-**Ответственность:**
-- Управление жизненным циклом аренды
-- Создание офферов с TTL
-- Начало аренды (извлечение пауэрбанка)
-- Возврат пауэрбанка
-- Предоставление информации об аренде
+**Ответственность:** управление жизненным циклом аренды (офферы, старт, возврат, информация)
 
+**API:**
+
+1. **POST /offers** - создание оффера
+2. **POST /rentals** - начало аренды (идемпотентно)
+3. **POST /rentals/{id}/return** - возврат (идемпотентно)
+4. **GET /rentals/{id}/summary** - текущая информация
 **Структура:**
 ```
 services/rentals/
@@ -99,6 +174,11 @@ services/rentals/
   "deposit": 300
 }
 ```
+
+**Идемпотентность:**
+- Не требуется (каждый запрос создаёт новый оффер)
+- Оффер живёт 10 минут, потом истекает
+- Пользователь может создать несколько офферов, но использовать только один
 
 **Логика:**
 1. Получить данные станции (stations API) -> tariff_id
@@ -150,83 +230,31 @@ def create_offer(payload: Dict[str, Any] = Body(...)):
 }
 ```
 
-#### POST /rentals
-Начало аренды (идемпотентное).
+**GET /offers/{id}/freshness** — проверка актуальности (expires_at > now)
 
-**Headers:**
-```
-Idempotency-Key: unique-key-123
-```
+**POST /rentals** — начало аренды (идемпотентно через offer_id)
+```python
+existing = session.query(Rental).filter_by(offer_id=offer_id).first()
+if existing: return existing  # идемпотентность
 
-**Request:**
-```json
-{
-  "offer_id": "offer789"
-}
-```
+try: clients.hold_deposit(user_id, amount)
+except: pass  # некритично, можно записать долг
 
-**Response:**
-```json
-{
-  "id": "rental999",
-  "status": "active",
-  "powerbank_id": "powerbank_638"
-}
+powerbank = clients.eject_powerbank(station_id)  # fail-fast!
+# Создаём rental в БД
 ```
 
-**Логика:**
-1. Проверить существование и свежесть оффера
-2. Проверить идемпотентность (если уже есть rental с этим offer_id)
-3. Захолдировать депозит (payments API)
-4. Извлечь пауэрбанк на станции (stations API - критичный!)
-5. Создать запись rental в БД
-6. Вернуть результат
+**POST /rentals/{id}/return** — возврат (идемпотентно через rental.status)
+```python
+if rental.status == "returned": return cached_result  # идемпотентность
 
-**Обработка отказов:**
-- Если stations недоступен -> ошибка 503
-- Если пауэрбанков нет -> откат холда, ошибка 409
-- Если payments недоступен -> создаем долг, продолжаем
-
-#### POST /rentals/{rental_id}/return
-Возврат пауэрбанка (идемпотентное).
-
-**Headers:**
-```
-Idempotency-Key: unique-key-456
+duration = (now - rental.started_at).total_seconds() / 60
+price = svc_clients.estimate_price(tariff_id, duration, user_id)
+billing = svc_clients.bill_rental(rental_id, price, user_id)
+rental.status = "returned"
 ```
 
-**Response:**
-```json
-{
-  "id": "rental999",
-  "status": "returned",
-  "billing": {
-    "status": "charged",
-    "amount_cents": 150
-  }
-}
-```
-
-**Логика:**
-1. Получить rental из БД
-2. Проверить идемпотентность (если уже returned)
-3. Рассчитать длительность и стоимость через pricing
-4. Вызвать billing service для списания
-5. Обновить статус rental
-6. Вернуть результат
-
-#### GET /rentals/{rental_id}/summary
-Информация об аренде и текущая стоимость.
-
-**Response:**
-```json
-{
-  "id": "rental999",
-  "status": "active",
-  "duration_minutes": 45,
-  "estimated_amount": 150
-}
-```
+**GET /rentals/{id}/summary** — текущая информация и стоимость
 
 **Интеграции:**
 ```python
@@ -246,16 +274,41 @@ svc_clients.bill_rental(...)              # billing -> debt
 ### 2. Pricing Service
 
 **Ответственность:**
-- Управление тарифами с кэшированием
+- Кэширование тарифов из внешнего сервиса `tariffs`
 - Расчет стоимости аренды
-- Фоллбэк при недоступности users
+- Фоллбэк при недоступности users (жадный прайсинг)
+
+**API:**
+
+1. **GET /tariffs/{id}** - кэширование тарифов:
+   - Проверяем in-memory кэш (словарь + timestamp)
+   - Если есть и свежий (< 10 мин) -> возвращаем из кэша
+   - Если устарел (> 10 мин) -> ошибка 503 (данные невалидны)
+   - Если нет в кэше -> идём во внешний `tariffs`, кэшируем, возвращаем
+   - TTL настраивается через config service
+
+2. **GET /price/estimate** - расчёт стоимости:
+   - Пытаемся получить профиль пользователя из `users`
+   - Если `users` недоступен -> фоллбэк на жадный прайсинг:
+     - Берём коэффициент из config (по умолчанию 1.2)
+     - Считаем как для непривилегированного пользователя
+     - Умножаем цену на коэффициент (защита от потерь)
+   - Получаем тариф через свой GET /tariffs/{id} (из кэша)
+   - Считаем: `(duration - free_period) * price_per_hour / 60`
+   - Применяем жадный коэффициент если был фоллбэк
+   - Возвращаем итоговую сумму
 
 **Структура:**
 ```
 services/pricing/
 ├── app.py              # FastAPI приложение
-└── (кэш в памяти)
+└── (кэш в памяти)      # tariff_cache, tariff_cache_ts
 ```
+
+**Почему не управляем тарифами:**
+- Тарифы живут во внешнем `tariffs` (дано в задании)
+- Pricing только кэширует, не создаёт/изменяет
+- Не дублируем логику
 
 **API эндпоинты:**
 
@@ -505,80 +558,25 @@ def reconcile(debt_id: str):
 
 ---
 
-## Идемпотентность
+## База данных
 
-### Механизм
-Использование заголовка `Idempotency-Key` для критичных операций.
+### Почему SQLite
 
-**Таблица в БД:**
-```sql
-CREATE TABLE idempotency_keys (
-    key TEXT PRIMARY KEY,
-    endpoint TEXT NOT NULL,
-    request_hash TEXT NOT NULL,
-    response JSON,
-    status_code INTEGER NOT NULL,
-    created_at TIMESTAMP NOT NULL
-);
-```
+**Для учебного проекта:**
+- Не нужно поднимать отдельный сервер БД
+- Простая настройка и есть опыт работы с ней
 
-**Реализация:**
-```python
-# packages/common/idempotency.py
-def _hash_request(payload: Dict[str, Any]) -> str:
-    raw = json.dumps(payload, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+**Ограничения SQLite:**
+- Лимит размера БД ~140 ГБ (у нас будет 630 ГБ за 2 года)
+- Нет репликации и шардирования
 
-def idempotent(endpoint_name: str):
-    def decorator(func):
-        async def wrapper(*args, idempotency_key: str = Header(None), **kwargs):
-            if not idempotency_key:
-                return await func(*args, **kwargs)
-            
-            # Хэшируем запрос
-            body = kwargs.get("body_payload") or {}
-            request_hash = _hash_request({"endpoint": endpoint_name, "body": body})
-            
-            # Проверяем существующий ключ
-            with session_scope() as s:
-                existing = s.get(IdempotencyKey, idempotency_key)
-                if existing and existing.request_hash == request_hash:
-                    # Возвращаем сохраненный ответ
-                    return JSONResponse(
-                        status_code=existing.status_code,
-                        content=json.loads(existing.response)
-                    )
-            
-            # Выполняем запрос
-            response = await func(*args, **kwargs)
-            
-            # Сохраняем результат
-            with session_scope() as s:
-                s.merge(IdempotencyKey(
-                    key=idempotency_key,
-                    endpoint=endpoint_name,
-                    request_hash=request_hash,
-                    response=json.dumps(response.body),
-                    status_code=response.status_code
-                ))
-            
-            return response
-        return wrapper
-    return decorator
-```
-
-**Использование:**
-```python
-@app.post("/rentals")
-@idempotent("create_rental")
-async def start_rental(payload: Dict, idempotency_key: str = Header(None)):
-    # Логика создания аренды
-    ...
-```
+**Для прода нужна Postgres:**
+- Поддерживает терабайты данных
+- Нормальная конкурентная запись
+- Репликация для отказоустойчивости
+- Индексы работают быстрее
 
 ---
-
-## База данных
 
 ### Схема
 
@@ -622,16 +620,6 @@ CREATE TABLE debts (
     status TEXT NOT NULL CHECK (status IN ('open','settled')),
     created_at TIMESTAMP NOT NULL,
     settled_at TIMESTAMP
-);
-
--- Идемпотентность
-CREATE TABLE idempotency_keys (
-    key TEXT PRIMARY KEY,
-    endpoint TEXT NOT NULL,
-    request_hash TEXT NOT NULL,
-    response JSON,
-    status_code INTEGER NOT NULL,
-    created_at TIMESTAMP NOT NULL
 );
 
 -- Миграции
@@ -679,146 +667,102 @@ def apply_migrations():
   "level": "INFO",
   "service": "rentals",
   "request_id": "req-abc123",
-  "idempotency_key": "idem-xyz789",
   "user_id": "user123",
   "rental_id": "rental999",
+  "offer_id": "offer789",
   "message": "Rental started successfully",
   "duration_ms": 145
 }
 ```
 
-**Реализация:**
-```python
-# packages/common/logging_utils.py
-import logging
-import json
-from datetime import datetime
-
-def setup_json_logging(service_name: str):
-    class JsonFormatter(logging.Formatter):
-        def format(self, record):
-            log_obj = {
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "level": record.levelname,
-                "service": service_name,
-                "message": record.getMessage(),
-            }
-            if hasattr(record, "request_id"):
-                log_obj["request_id"] = record.request_id
-            if hasattr(record, "user_id"):
-                log_obj["user_id"] = record.user_id
-            return json.dumps(log_obj)
-    
-    handler = logging.StreamHandler()
-    handler.setFormatter(JsonFormatter())
-    logging.root.addHandler(handler)
-    logging.root.setLevel(logging.INFO)
-```
-
-### Метрики Prometheus
-
-**Rentals:**
-```python
-from prometheus_client import Counter, Histogram
-
-metric_offers_created = Counter(
-    "rentals_offers_created_total",
-    "Total offers created"
-)
-
-metric_rentals_started = Counter(
-    "rentals_started_total",
-    "Total rentals started"
-)
-
-metric_rentals_returned = Counter(
-    "rentals_returned_total",
-    "Total rentals returned"
-)
-
-metric_request_duration = Histogram(
-    "rentals_request_duration_seconds",
-    "Request duration",
-    ["endpoint"]
-)
-```
-
-**Pricing:**
-```python
-metric_tariff_hits = Counter(
-    "pricing_tariff_cache_hits_total",
-    "Tariff cache hits"
-)
-
-metric_tariff_misses = Counter(
-    "pricing_tariff_cache_misses_total",
-    "Tariff cache misses"
-)
-
-metric_tariff_stale = Counter(
-    "pricing_tariff_stale_total",
-    "Tariff entries considered stale"
-)
-```
-
-**Billing:**
-```python
-metric_debt_opened = Counter(
-    "billing_debt_opened_total",
-    "Debts created"
-)
-
-metric_debt_settled = Counter(
-    "billing_debt_settled_total",
-    "Debts settled"
-)
-```
-
-**Эндпоинт метрик:**
-```python
-from prometheus_client import make_asgi_app
-
-app = FastAPI()
-app.mount("/metrics", make_asgi_app())
-```
+**Prometheus метрики:**
+- **Rentals:** `offers_created_total`, `rentals_started_total`, `rentals_returned_total`
+- **Pricing:** `tariff_cache_hits_total`, `tariff_cache_misses_total`, `tariff_stale_total`
+- **Billing:** `debt_opened_total`, `debt_settled_total`
+- **Эндпоинт:** `GET /metrics` (prometheus_client)
 
 ---
 
 ## Расчет ресурсов
 
-### Нагрузка
-- **X = 10 RPS** создание заказов
-- **Y = 100** просмотров на аренду
-- **Период хранения**: 2 года
+### Исходные данные
+- **х = 10 RPS** — одновременное создание заказов
+- **Y = 100** — число просмотров информации об аренде на одну аренду
+- **Z = 1 КБ** — размер записи об аренде
+- **Хранение**: 2 года
 
-### Оценка данных
+### Rentals Service
 
-**Аренды в день:**
-- 10 RPS × 86400 сек = 864,000 аренд/день
-- 864,000 × 365 × 2 = 630,720,000 аренд за 2 года
+**Нагрузка:**
+- POST /offers: 10 RPS (перед каждой арендой создаём оффер)
+- POST /rentals: 10 RPS (начало аренды)
+- POST /rentals/{id}/return: 10 RPS (возврат)
+- GET /rentals/{id}/summary: ~1000 RPS (Y=100 просмотров на аренду)
 
-**Размер данных:**
-- 1 аренда = 1 КБ
-- 630M аренд × 1 КБ ≈ 630 ГБ за 2 года
+**Итого:** ~1030 RPS, из них 97% — чтение
 
-**Просмотры (summary):**
-- 864,000 аренд/день × 100 просмотров = 86,400,000 запросов/день
-- ≈ 1000 RPS на GET /rentals/{id}/summary
+**Данные в БД:**
+- Таблица `offers`: 10 офферов/сек х 600 сек TTL = ~6000 активных офферов
+  - Размер: 6000 х 0.2 КБ = 1.2 МБ (можно чистить старые)
+- Таблица `rentals`: 864000 аренд/день х 730 дней = 630M записей
+  - Размер: 630M х 1 КБ = 630 ГБ за 2 года
 
-**Вывод:** Необходимо кэширование для summary или индексы в БД.
+**Индексы:**
+- `rental.id` (PRIMARY KEY) — для быстрого поиска в summary
+- `rental.offer_id` (UNIQUE) — для идемпотентности создания аренды
 
-### Кэши
+### Pricing Service
+
+**Нагрузка:**
+- GET /tariffs/{id}: вызывается при каждом создании оффера = 10 RPS
+  - С кэшем hit rate 95% -> нагрузка на внешний tariffs: 0.5 RPS
+- GET /price/estimate: вызывается при summary и return = ~1010 RPS
+  - Тарифы берутся из кэша
+
+**Итого:** ~1020 RPS, почти всё из кэша
+
+**Кэш тарифов:**
+- Размер: ~100 тарифов х 0.5 КБ = 50 КБ
+- TTL: 10 минут (настраивается через configs)
+- Hit rate: 95%
+- Экономия: с 10 RPS до 0.5 RPS на внешний сервис (в 20 раз)
 
 **Config cache:**
 - Размер: ~1 КБ
 - Обновление: каждые 60 сек
-- Нагрузка на configs: 1/60 RPS ≈ 0.017 RPS
+- Нагрузка на configs: 1/60 RPS = 0.017 RPS
 
-**Tariff cache:**
-- Размер: ~100 тарифов × 0.5 КБ = 50 КБ
-- TTL: 10 минут
-- Hit rate: ~95% (при стабильных тарифах)
-- Нагрузка на tariffs: 10 RPS × 0.05 = 0.5 RPS
+**Вывод:** Кэши критичны. Без них убьём внешние сервисы tariffs и configs.
+
+### Billing Service
+
+**Нагрузка:**
+- POST /bill/{rental_id}: 10 RPS (при каждом возврате)
+- POST /reconcile/{debt_id}: ~0.1 RPS (только когда payments был недоступен)
+
+**Итого:** ~10 RPS
+
+**Данные в БД:**
+- Таблица `debts`: зависит от доступности payments
+  - Если payments доступен 99.9% времени -> ~860 долгов/день
+  - За 2 года: 860 х 730 = 628000 долгов
+  - Размер: 628000 х 0.3 КБ = 188 МБ
+
+**Вывод:** Минимальная нагрузка. Долгов мало, если payments работает стабильно.
+
+### База данных (общая)
+
+**Итоговый объём за 2 года:**
+- Rentals: 630 ГБ (основное)
+- Debts: 188 МБ
+- Offers: 1.2 МБ (активные)
+- **Итого: ~630 ГБ**
+
+**Проблема SQLite:** лимит ~140 ГБ, нужно 630 ГБ
+
+**Для прода:** Postgres + партиционирование по дате + старые аренды в архив
+
+**Для дз:** SQLite достаточно (реальных 2 лет данных не будет)
 
 ---
 
